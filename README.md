@@ -68,12 +68,13 @@ ICM UI (export_2d_mesh_parallel_v2.rb)
   ├── Generates merge_workers.rb
   └── Generates launch_parallel.bat
 launch_parallel.bat
-  ├── Launches N × IcmExchange.exe workers in background
+  ├── Launches N × IcmExchange.exe workers (minimized to taskbar)
   ├── Each worker: loops its timestep chunk (process-and-delete)
   ├── Each worker: writes worker_X_done.txt on completion
+  ├── Worker windows auto-close when finished
   ├── Polls every 5s until all done files exist
   ├── Runs merge_workers.rb → <Simulation Name>_Hazard Mapping.csv
-  └── Cleans up all temporary files
+  └── Auto-cleans all temporary files (workers, done files, scripts)
 ```
 #### Step 1: Run the Generator
 Open `export_2d_mesh_parallel_v2.rb` inside InfoWorks ICM. The dialog prompts for:
@@ -88,9 +89,9 @@ Open `export_2d_mesh_parallel_v2.rb` inside InfoWorks ICM. The dialog prompts fo
 | **IcmExchange.exe Path** | Full path to IcmExchange executable | Auto-detected |
 A second dialog will ask for the **total timestep count** (since the UI cannot count timesteps — only IcmExchange can).
 #### Step 2: Launch the Batch File
-Double-click `launch_parallel.bat`. Worker windows will open, process their chunks, and **auto-close** when finished. The master window automatically detects completion and runs the merge.
+Double-click `launch_parallel.bat`. Worker processes run **minimized in the taskbar** — no pop-up windows. The master window automatically detects when all workers are done and runs the merge.
 #### Step 3: Collect Results
-The final CSV is named `<Simulation Name>_Hazard Mapping.csv` in your output folder.
+The final CSV is named `<Simulation Name>_Hazard Mapping.csv` in your output folder. All temporary files (worker scripts, done files, merge script, batch file) are automatically cleaned up — only the final CSV remains.
 ## Files
 | File | Purpose |
 |---|---|
