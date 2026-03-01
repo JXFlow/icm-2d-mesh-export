@@ -400,8 +400,6 @@ def write_merge_script(path, safe_out, num_workers, sim_name)
   lines << "    end"
   lines << "  end"
   lines << "  File.delete(chunk_file) rescue nil"
-  lines << "  File.delete(File.join(folder, \"worker_c\#{c}.rb\")) rescue nil"
-  lines << "  File.delete(File.join(folder, \"worker_\#{c}_done.txt\")) rescue nil"
   lines << "end"
   lines << ""
   lines << "final_csv = File.join(folder, '#{sim_name}_Hazard Mapping.csv')"
@@ -412,6 +410,17 @@ def write_merge_script(path, safe_out, num_workers, sim_name)
   lines << "  end"
   lines << "end"
   lines << "puts \"MERGE COMPLETE -> \#{final_csv}\""
+  lines << ""
+  lines << "# Cleanup worker files (separate pass with delay for Windows file locks)"
+  lines << "puts 'Cleaning up worker files...'"
+  lines << "sleep(5)"
+  lines << "(0...#{num_workers}).each do |c|"
+  lines << "  File.delete(File.join(folder, \"worker_c\#{c}.rb\")) rescue nil"
+  lines << "  File.delete(File.join(folder, \"worker_\#{c}_done.txt\")) rescue nil"
+  lines << "end"
+  lines << "File.delete(File.join(folder, 'merge_workers.rb')) rescue nil"
+  lines << "File.delete(File.join(folder, 'launch_parallel.bat')) rescue nil"
+  lines << "puts 'Cleanup complete!'"
 
   File.write(path, lines.join("\n"))
 end
