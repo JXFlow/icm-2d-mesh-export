@@ -4,6 +4,7 @@
 # Each worker runs in a separate IcmExchange.exe process.
 
 require 'date'
+require 'tmpdir'
 
 def generate_export_scripts
   puts "=" * 60
@@ -110,13 +111,18 @@ def generate_export_scripts
   ], false)
   return if ts_prompt.nil?
   
-  count = ts_prompt[0].to_i
+  count_text = ts_prompt[0].strip
+  count = count_text.match?(/\A[0-9]+\z/) ? count_text.to_i : 0
   puts "User-provided Timestep Count: #{count}"
 
   if count <= 0
-    puts "ERROR: Timestep count must be > 0."
+    puts "ERROR: Timestep count must be a positive whole number."
     return
   end
+
+  # A fresh directory prevents stale results/status files from satisfying a new run.
+  out_folder = Dir.mktmpdir('mesh_export_', out_folder)
+  safe_out = out_folder.gsub('\\', '/')
 
   # --- Chunk the timesteps ---
   chunk_size = (count / cores.to_f).ceil
@@ -136,6 +142,7 @@ def generate_export_scripts
       core_idx:    core_idx,
       start_idx:   start_idx,
       end_idx:     end_idx,
+      expected_count: count,
       safe_db:     safe_db,
       safe_out:    safe_out,
       resolved_id: resolved_id,
@@ -149,7 +156,7 @@ def generate_export_scripts
 
   sim_name = target.name.to_s.gsub(/[\\\/:*?"<>|]/, '_')  # sanitize for filename
   merge_path = File.join(out_folder, "merge_workers.rb")
-  write_merge_script(merge_path, safe_out, worker_files.size, sim_name)
+  write_merge_script(merge_path, safe_out, worker_files.size, sim_name, count)
   puts "Generated: #{merge_path}"
 
   # --- Generate Launch Batch File ---
@@ -182,6 +189,7 @@ def write_worker_script(path, opts)
   lines = []
   lines << "require 'date'"
   lines << "require 'fileutils'"
+  lines << "require 'csv'"
   lines << ""
   lines << "begin"
   lines << "  core_idx = #{opts[:core_idx]}"
@@ -189,21 +197,20 @@ def write_worker_script(path, opts)
   lines << "  end_idx = #{opts[:end_idx]}"
   lines << "  puts \"Worker \#{core_idx}: Starting chunk (\#{start_idx} to \#{end_idx})...\""
   lines << "  puts \"Worker \#{core_idx}: Connecting to database...\""
-  lines << "  db = WSApplication.open('#{opts[:safe_db]}', false)"
+  lines << "  db = WSApplication.open(#{opts[:safe_db].dump}, false)"
   lines << "  puts \"Worker \#{core_idx}: Connected!\""
   lines << ""
-  lines << "  target = db.model_object('#{opts[:resolved_id]}') rescue nil"
+  lines << "  target = db.model_object(#{opts[:resolved_id].dump}) rescue nil"
   lines << ""
   lines << "  if target.nil?"
   lines << "    ['Sim', 'Run'].each do |t|"
-  lines << "      target = db.model_object_from_type_and_id(t, #{opts[:resolved_id]}) rescue nil"
+  lines << "      target = db.model_object_from_type_and_id(t, #{opts[:resolved_id].dump}.to_i) rescue nil"
   lines << "      break if target"
   lines << "    end"
   lines << "  end"
   lines << ""
   lines << "  if target.nil?"
-  lines << "    puts \"Worker \#{core_idx}: ERROR - Could not find target!\""
-  lines << "    exit(1)"
+  lines << "    raise 'Could not find target'"
   lines << "  end"
   lines << ""
   lines << "  puts \"Worker \#{core_idx}: Found target: \#{target.name rescue 'Unknown'} (Type: \#{target.type rescue 'Unknown'})\""
@@ -225,10 +232,11 @@ def write_worker_script(path, opts)
   lines << "  steps = steps.to_a if steps.respond_to?(:to_a)"
   lines << "  total_count = steps.count"
   lines << "  puts \"Worker \#{core_idx}: Total timesteps in simulation: \#{total_count}\""
-  lines << "  end_idx = [end_idx, total_count - 1].min"
+  lines << "  raise \"Timestep count mismatch: entered #{opts[:expected_count]}, actual \#{total_count}. Regenerate scripts with the actual count.\" unless total_count == #{opts[:expected_count]} && total_count > 0"
+  lines << "  raise 'Invalid timestep range' unless start_idx >= 0 && end_idx >= start_idx && end_idx < total_count"
   lines << "  puts \"Worker \#{core_idx}: Processing steps \#{start_idx} to \#{end_idx}\""
   lines << ""
-  lines << "  folder = '#{opts[:safe_out]}'"
+  lines << "  folder = #{opts[:safe_out].dump}"
   lines << "  temp_folder = File.join(folder, \"temp_calc_\#{core_idx}\")"
   lines << "  Dir.mkdir(temp_folder) unless Dir.exist?(temp_folder)"
   lines << ""
@@ -239,7 +247,8 @@ def write_worker_script(path, opts)
   lines << "    'AlternativeNaming' => false"
   lines << "  }"
   lines << ""
-  lines << "  mult_val = #{opts[:mult_str]}.to_f"
+  lines << "  mult_val = Float(#{opts[:mult_str].dump})"
+  lines << "  raise 'Multiplier must be finite' unless mult_val.finite?"
   lines << "  keep_csvs = #{opts[:keep_csv]}"
   lines << "  max_data = {}"
   lines << "  col_map = nil"
@@ -253,11 +262,11 @@ def write_worker_script(path, opts)
   lines << "    target.results_GIS_export('MIF', idx, params, temp_folder)"
   lines << ""
   lines << "    mif_files = Dir.glob(File.join(temp_folder, '**', '*.[mM][iI][fF]'))"
-  lines << "    next if mif_files.empty?"
+  lines << "    raise \"Step \#{idx}: expected one MIF file, found \#{mif_files.size}\" unless mif_files.size == 1"
   lines << "    mif_file = mif_files.first"
   lines << ""
-  lines << "    # Parse column map only on the first timestep"
-  lines << "    if col_map.nil?"
+  lines << "    # Validate the column map on every timestep."
+  lines << "    begin"
   lines << "      col_map = {}"
   lines << "      col_index = 0"
   lines << "      in_columns = false"
@@ -278,6 +287,7 @@ def write_worker_script(path, opts)
   lines << "      end"
   lines << "      i_depth = col_map[col_map.keys.find{|k| k.upcase.include?('DEPTH')}] rescue -1"
   lines << "      i_speed = col_map[col_map.keys.find{|k| k.upcase.include?('SPEED')}] rescue -1"
+  lines << "      raise \"Step \#{idx}: missing Depth/Speed columns\" unless i_depth && i_speed && i_depth >= 0 && i_speed >= 0"
   lines << "      puts \"Worker \#{core_idx}: Columns mapped (Depth=\#{i_depth}, Speed=\#{i_speed})\""
   lines << "    end"
   lines << ""
@@ -286,8 +296,7 @@ def write_worker_script(path, opts)
   lines << "    basename = File.basename(mif_file, '.*')"
   lines << "    mid_candidates = [File.join(dirname, \"\#{basename}.mid\"), File.join(dirname, \"\#{basename}.MID\")].select{|f| File.exist?(f)}"
   lines << "    if mid_candidates.empty?"
-  lines << "      File.delete(mif_file) rescue nil"
-  lines << "      next"
+  lines << "      raise \"Step \#{idx}: missing MID file\""
   lines << "    end"
   lines << "    mid_file = mid_candidates.first"
   lines << ""
@@ -298,14 +307,17 @@ def write_worker_script(path, opts)
   lines << "      csv_handle.puts 'Element_ID,DxV,Depth,Speed,Hazard_Category'"
   lines << "    end"
   lines << ""
-  lines << "    File.foreach(mid_file) do |line|"
-  lines << "      parts = line.strip.split(',')"
-  lines << "      next if parts.size < 4"
+  lines << "    step_ids = {}"
+  lines << "    CSV.foreach(mid_file) do |parts|"
+  lines << "      raise \"Step \#{idx}: malformed MID row\" unless parts.size == col_map.size && parts[1] && !parts[1].strip.empty?"
   lines << "      id = parts[1]"
-  lines << "      dep = (i_depth >= 0) ? parts[i_depth].to_f : 0.0"
-  lines << "      s   = (i_speed >= 0) ? parts[i_speed].to_f : 0.0"
+  lines << "      raise \"Step \#{idx}: duplicate element \#{id}\" if step_ids[id]"
+  lines << "      step_ids[id] = true"
+  lines << "      raise \"Step \#{idx}: unexpected element \#{id}\" if idx > start_idx && !max_data.key?(id)"
+  lines << "      dep = Float(parts[i_depth]); s = Float(parts[i_speed])"
   lines << "      dv = dep * s"
   lines << "      d_calc = dv * mult_val"
+  lines << "      raise \"Step \#{idx}: non-finite result\" unless [dep, s, dv, d_calc].all?(&:finite?)"
   lines << "      hz_cat = 1"
   lines << "      if dep >= 0.01"
   lines << "        if dv > 4.0 || dep > 4.0 || s > 4.0"
@@ -336,10 +348,11 @@ def write_worker_script(path, opts)
   lines << "      end"
   lines << "    end"
   lines << "    csv_handle.close if csv_handle"
+  lines << "    raise \"Step \#{idx}: empty or incomplete element results\" if step_ids.empty? || step_ids.size != max_data.size"
   lines << ""
   lines << "    # Delete immediately (process-and-delete pattern)"
-  lines << "    File.delete(mif_file) rescue nil"
-  lines << "    File.delete(mid_file) rescue nil"
+  lines << "    File.delete(mif_file)"
+  lines << "    File.delete(mid_file)"
   lines << "  end"
   lines << ""
   lines << "  Dir.glob(File.join(temp_folder, '**', '*')).each { |f| File.delete(f) rescue nil }"
@@ -357,11 +370,12 @@ def write_worker_script(path, opts)
   lines << "  puts \"Worker \#{core_idx}: FINISHED! Wrote \#{chunk_csv}\""
   lines << ""
   lines << "  # Write sentinel file so master batch knows we are done"
-  lines << "  File.write(File.join(folder, \"worker_\#{core_idx}_done.txt\"), 'done')"
+  lines << "  File.write(File.join(folder, \"worker_\#{core_idx}_done.txt\"), [start_idx, end_idx, total_count, max_data.size].join(','))"
   lines << ""
   lines << "rescue => e"
-  lines << "  File.write(File.join('#{opts[:safe_out]}', \"worker_\#{core_idx}_error.log\"), e.message + \"\\n\" + e.backtrace.join(\"\\n\"))"
+  lines << "  File.write(File.join(#{opts[:safe_out].dump}, \"worker_\#{core_idx}_error.log\"), e.message + \"\\n\" + e.backtrace.join(\"\\n\"))"
   lines << "  puts \"Worker \#{core_idx}: FATAL ERROR: \#{e.message}\""
+  lines << "  exit(1)"
   lines << "end"
 
   File.write(path, lines.join("\n"))
@@ -370,24 +384,37 @@ end
 # -------------------------------------------------------
 # Write the merge script (combines worker CSVs)
 # -------------------------------------------------------
-def write_merge_script(path, safe_out, num_workers, sim_name)
+def write_merge_script(path, safe_out, num_workers, sim_name, expected_count)
   lines = []
-  lines << "folder = '#{safe_out}'"
+  lines << "require 'csv'"
+  lines << "folder = #{safe_out.dump}"
+  lines << "begin"
   lines << "puts 'Merging worker results...'"
   lines << "global_max = {}"
+  lines << "next_step = 0"
+  lines << "expected_header = 'Element_ID,Max_DxV,Max_Depth,Max_Speed,Step_Index_Max_DxV,Step_Index_Max_Depth,Step_Index_Max_Speed,Max_Hazard_Category'.split(',')"
   lines << ""
   lines << "(0...#{num_workers}).each do |c|"
+  lines << "  raise \"Worker \#{c} failed; inspect its error log\" if File.exist?(File.join(folder, \"worker_\#{c}_error.log\"))"
+  lines << "  status = File.read(File.join(folder, \"worker_\#{c}_done.txt\")).split(',').map { |v| Integer(v, 10) }"
+  lines << "  first, last, total, rows = status"
+  lines << "  raise \"Worker \#{c}: invalid completion record\" unless status.size == 4 && first == next_step && last >= first && total == #{expected_count} && last < total && rows > 0"
+  lines << "  next_step = last + 1"
   lines << "  chunk_file = File.join(folder, \"worker_\#{c}_max.csv\")"
-  lines << "  next unless File.exist?(chunk_file)"
   lines << "  headers = true"
-  lines << "  File.foreach(chunk_file) do |line|"
-  lines << "    if headers; headers = false; next; end"
-  lines << "    parts = line.strip.split(',')"
-  lines << "    next if parts.size < 8"
+  lines << "  ids = {}"
+  lines << "  CSV.foreach(chunk_file) do |parts|"
+  lines << "    if headers"
+  lines << "      raise \"Worker \#{c}: invalid CSV header\" unless parts == expected_header"
+  lines << "      headers = false; next"
+  lines << "    end"
+  lines << "    raise \"Worker \#{c}: malformed CSV row\" unless parts.size == 8 && parts[0] && !parts[0].strip.empty?"
   lines << "    id = parts[0]"
-  lines << "    dxv = parts[1].to_f; dep = parts[2].to_f; spd = parts[3].to_f"
-  lines << "    idx_dxv = parts[4].to_i; idx_dep = parts[5].to_i; idx_spd = parts[6].to_i"
-  lines << "    hz = parts[7].to_i"
+  lines << "    raise \"Worker \#{c}: duplicate or unexpected element \#{id}\" if ids[id] || (c > 0 && !global_max.key?(id))"
+  lines << "    ids[id] = true"
+  lines << "    dxv, dep, spd = parts[1..3].map { |v| Float(v) }"
+  lines << "    idx_dxv, idx_dep, idx_spd, hz = parts[4..7].map { |v| Integer(v, 10) }"
+  lines << "    raise \"Worker \#{c}: invalid values\" unless [dxv, dep, spd].all?(&:finite?) && [idx_dxv, idx_dep, idx_spd].all? { |v| v >= first && v <= last } && (1..6).include?(hz)"
   lines << "    if global_max[id].nil?"
   lines << "      global_max[id] = [dxv, dep, spd, idx_dxv, idx_dep, idx_spd, hz]"
   lines << "    else"
@@ -399,28 +426,25 @@ def write_merge_script(path, safe_out, num_workers, sim_name)
   lines << "      global_max[id] = cur"
   lines << "    end"
   lines << "  end"
-  lines << "  File.delete(chunk_file) rescue nil"
+  lines << "  raise \"Worker \#{c}: empty or incomplete CSV\" if headers || ids.size != rows || ids.size != global_max.size"
   lines << "end"
+  lines << "raise 'Incomplete timestep coverage' unless next_step == #{expected_count}"
   lines << ""
-  lines << "final_csv = File.join(folder, '#{sim_name}_Hazard Mapping.csv')"
-  lines << "File.open(final_csv, 'w') do |csv|"
+  lines << "final_csv = File.join(folder, #{(sim_name + '_Hazard Mapping.csv').dump})"
+  lines << "File.open(final_csv + '.partial', 'w') do |csv|"
   lines << "  csv.puts 'Element_ID,Max_DxV,Max_Depth,Max_Speed,Step_Index_Max_DxV,Step_Index_Max_Depth,Step_Index_Max_Speed,Max_Hazard_Category'"
   lines << "  global_max.each do |id, v|"
   lines << "    csv.puts \"\#{id},\#{v[0]},\#{v[1]},\#{v[2]},\#{v[3]},\#{v[4]},\#{v[5]},\#{v[6]}\""
   lines << "  end"
   lines << "end"
+  lines << "File.rename(final_csv + '.partial', final_csv)"
+  lines << "File.write(File.join(folder, 'merge_done.txt'), 'done')"
   lines << "puts \"MERGE COMPLETE -> \#{final_csv}\""
-  lines << ""
-  lines << "# Cleanup worker files (separate pass with delay for Windows file locks)"
-  lines << "puts 'Cleaning up worker files...'"
-  lines << "sleep(5)"
-  lines << "(0...#{num_workers}).each do |c|"
-  lines << "  File.delete(File.join(folder, \"worker_c\#{c}.rb\")) rescue nil"
-  lines << "  File.delete(File.join(folder, \"worker_\#{c}_done.txt\")) rescue nil"
+  lines << "rescue => e"
+  lines << "  File.write(File.join(folder, 'merge_error.log'), e.message + \"\\n\" + e.backtrace.join(\"\\n\"))"
+  lines << "  puts \"MERGE FAILED: \#{e.message}\""
+  lines << "  exit(1)"
   lines << "end"
-  lines << "File.delete(File.join(folder, 'merge_workers.rb')) rescue nil"
-  lines << "File.delete(File.join(folder, 'launch_parallel.bat')) rescue nil"
-  lines << "puts 'Cleanup complete!'"
 
   File.write(path, lines.join("\n"))
 end
@@ -436,6 +460,15 @@ def write_launch_bat(path, icm_exe, worker_files, merge_path)
   
   lines = []
   lines << "@echo off"
+  lines << "setlocal DisableDelayedExpansion"
+  lines << 'if not "%~1"=="" goto %~1'
+  lines << "if not exist \"#{icm_win}\" goto FAILED"
+  lines << "rem Each generated export is single-use; regenerate after a failure."
+  lines << "mkdir \"#{out_folder}\\launch_started\" 2>nul"
+  lines << "if errorlevel 1 goto FAILED"
+  lines << "rem Default worker wait limit: 24 hours (5-second polls)."
+  lines << "set max_polls=17280"
+  lines << "set polls=0"
   lines << "echo ============================================"
   lines << "echo  Parallel 2D Mesh Export Launcher"
   lines << "echo ============================================"
@@ -444,8 +477,8 @@ def write_launch_bat(path, icm_exe, worker_files, merge_path)
   lines << "echo."
   
   worker_files.each_with_index do |wf, i|
-    wf_win = wf.gsub('/', '\\')
-    lines << "start /MIN \"ICM Worker #{i}\" cmd /c \"\"#{icm_win}\" \"#{wf_win}\" /nogui\""
+    lines << "start /MIN \"ICM Worker #{i}\" cmd /c call \"%~f0\" WORKER_#{i}"
+    lines << "if errorlevel 1 goto FAILED"
   end
   
   lines << "echo."
@@ -453,11 +486,15 @@ def write_launch_bat(path, icm_exe, worker_files, merge_path)
   lines << "echo Waiting for all workers to finish..."
   lines << "echo."
   lines << ":POLL_LOOP"
-  lines << "timeout /t 5 /nobreak >nul"
-  
-  # Check if all done files exist
+  # Check every error before waiting for any pending worker.
   (0...num_workers).each do |i|
-    lines << "if not exist \"#{out_folder}\\worker_#{i}_done.txt\" goto POLL_LOOP"
+    lines << "if exist \"#{out_folder}\\worker_#{i}_error.log\" goto FAILED"
+  end
+  (0...num_workers).each do |i|
+    lines << "if not exist \"#{out_folder}\\worker_#{i}_exited.txt\" goto WAIT"
+  end
+  (0...num_workers).each do |i|
+    lines << "if not exist \"#{out_folder}\\worker_#{i}_done.txt\" goto FAILED"
   end
   
   lines << "echo."
@@ -466,11 +503,37 @@ def write_launch_bat(path, icm_exe, worker_files, merge_path)
   lines << "echo ============================================"
   lines << "echo."
   lines << "\"#{icm_win}\" \"#{merge_win}\" /nogui"
+  lines << "if errorlevel 1 goto FAILED"
+  lines << "if exist \"#{out_folder}\\merge_error.log\" goto FAILED"
+  lines << "if not exist \"#{out_folder}\\merge_done.txt\" goto FAILED"
   lines << "echo."
   lines << "echo All done!"
   lines << "pause"
+  lines << "exit /b 0"
+  lines << ":WAIT"
+  lines << "set /a polls+=1 >nul"
+  lines << "if %polls% GEQ %max_polls% goto FAILED"
+  lines << "timeout /t 5 /nobreak >nul"
+  lines << "goto POLL_LOOP"
+  lines << ":FAILED"
+  lines << "echo EXPORT FAILED: worker/merge error, missing completion, reused launcher, or wait limit reached."
+  lines << "echo Inspect logs in \"#{out_folder}\". Do not use partial results."
+  lines << "echo Other workers may still be running. Stop them before removing files; regenerate to retry."
+  lines << "pause"
+  lines << "exit /b 1"
+
+  # The wrapper detects native crashes/startup failures even if Ruby cannot log them.
+  worker_files.each_with_index do |wf, i|
+    wf_win = wf.gsub('/', '\\')
+    lines << ":WORKER_#{i}"
+    lines << "\"#{icm_win}\" \"#{wf_win}\" /nogui >\"#{out_folder}\\worker_#{i}_console.log\" 2>&1"
+    lines << "if errorlevel 1 >>\"#{out_folder}\\worker_#{i}_error.log\" echo IcmExchange exited unsuccessfully. See console log."
+    lines << "if not exist \"#{out_folder}\\worker_#{i}_done.txt\" >>\"#{out_folder}\\worker_#{i}_error.log\" echo Worker exited without successful completion."
+    lines << ">\"#{out_folder}\\worker_#{i}_exited.txt\" echo exited"
+    lines << "exit /b 0"
+  end
 
   File.write(path, lines.join("\r\n"))
 end
 
-generate_export_scripts
+generate_export_scripts if defined?(WSApplication)

@@ -4,8 +4,8 @@ Export per-element **Max(Depth × Speed)** hazard results from InfoWorks ICM 2D 
 InfoWorks ICM does not provide a direct way to export per-element 2D mesh results (like flood hazard = Depth × Velocity) across all timesteps. The Ruby API does not expose individual 2D mesh elements as iterable objects, and bulk GIS exports can consume hundreds of gigabytes of disk space.
 ## The Solution
 A two-stage Ruby script that:
-1. **Runs inside ICM** (`export_2d_mesh.rb`) — prompts the user for options and generates a worker script + batch file.
-2. **Runs via IcmExchange** (`worker_export.rb` + `run_export.bat`) — iterates through every timestep, exports temporary MIF/MID files, parses them, tracks maximums in memory, and cleans up after each step.
+1. **Runs inside ICM** (`export_2d_mesh.rb`) — prompts for options and generates parallel worker scripts, a merge script and a launcher.
+2. **Runs via IcmExchange** (`launch_parallel.bat`) — processes all timestep chunks, checks worker completion and merges validated maxima.
 ### How It Works
 ```
 For each timestep (0 → N):
@@ -16,11 +16,11 @@ For each timestep (0 → N):
   5. Update in-memory maximums if current values exceed stored values
   6. Delete temporary files immediately
   7. Move to next timestep
-Write final Max_DxV_Final.csv
+Merge validated chunks into <Simulation Name>_Hazard Mapping.csv
 ```
-This keeps disk usage to ~1 timestep at a time, regardless of simulation size.
+This keeps temporary GIS disk usage to approximately one timestep per worker, regardless of simulation length.
 ## Output
-### `Max_DxV_Final.csv`
+### `<Simulation Name>_Hazard Mapping.csv`
 | Column | Description |
 |---|---|
 | `Element_ID` | 2D mesh element number |
@@ -41,28 +41,12 @@ This keeps disk usage to ~1 timestep at a time, regardless of simulation size.
 | 6 | Unsafe for vehicles and people. Considered vulnerable to failure | D*V > 4.0 |
 *(Note: A minimum "wet/dry" filter of depth ≥ 0.01m is applied to ignore numerical noise. Dry elements default to Category 1).*
 ## Usage
-### Single-Threaded Mode (`export_2d_mesh.rb`)
-#### Step 1: Run the Generator
-Open `export_2d_mesh.rb` as a Ruby script inside InfoWorks ICM. A dialog will prompt for:
-| Option | Description | Default |
-|---|---|---|
-| **Run ID** | The simulation Run ID (GUID or integer) | — |
-| **Database Path** | Path to your ICM database | Auto-detected |
-| **Output Folder** | Where to save output files | `D:\Temp` |
-| **Multiplier** | Scale factor applied to DxV calculation | `1.0` |
-| **Check Columns Only?** | If checked, exports one timestep and prints column names to the console for verification | `false` |
-| **Keep Timestep CSVs?** | If checked, saves a `Step_X.csv` for every timestep (used for debugging) | `false` |
-#### Step 2: Run the Batch File
-Navigate to your output folder and double-click `run_export.bat`. This launches IcmExchange in headless mode to process all timesteps.
-#### Step 3: Collect Results
-Once complete, `Max_DxV_Final.csv` will be in your output folder.
----
-### Parallel Mode (`export_2d_mesh_parallel_v2.rb`)
+### Parallel export (`export_2d_mesh.rb`)
 Splits the export across multiple simultaneous `IcmExchange.exe` processes for significantly faster processing.
 > **Note:** Each parallel worker consumes one ICM license. Running 4 workers = 4 concurrent licenses.
 #### Architecture
 ```
-ICM UI (export_2d_mesh_parallel_v2.rb)
+ICM UI (export_2d_mesh.rb)
   ├── Resolves Run ID → GUID
   ├── Generates worker_c0.rb ... worker_cN.rb (one per core)
   ├── Generates merge_workers.rb
@@ -70,37 +54,55 @@ ICM UI (export_2d_mesh_parallel_v2.rb)
 launch_parallel.bat
   ├── Launches N × IcmExchange.exe workers (minimized to taskbar)
   ├── Each worker: loops its timestep chunk (process-and-delete)
-  ├── Each worker: writes worker_X_done.txt on completion
+  ├── Each worker: validates total timesteps and every MIF/MID result
+  ├── Each worker: writes worker_X_done.txt only after its CSV is closed
   ├── Worker windows auto-close when finished
-  ├── Polls every 5s until all done files exist
+  ├── Polls every 5s for errors and process exits, with a finite wait limit
   ├── Runs merge_workers.rb → <Simulation Name>_Hazard Mapping.csv
-  └── Auto-cleans all temporary files (workers, done files, scripts)
+  └── Publishes the final CSV only after every chunk passes validation
 ```
 #### Step 1: Run the Generator
-Open `export_2d_mesh_parallel_v2.rb` inside InfoWorks ICM. The dialog prompts for:
+Open `export_2d_mesh.rb` inside InfoWorks ICM. The dialog prompts for:
 | Option | Description | Default |
 |---|---|---|
 | **Run ID** | The simulation Run ID | — |
 | **Database Path** | Path to ICM database | Auto-detected |
-| **Output Folder** | Output directory | `D:\Temp` |
+| **Output Folder** | Parent directory for a fresh `mesh_export_...` subfolder | `D:\Temp` |
 | **Multiplier** | DxV scale factor | `1.0` |
 | **Keep Timestep CSVs?** | Save per-step CSVs | `false` |
 | **Number of Parallel Workers** | How many IcmExchange processes to spawn | `4` |
-| **IcmExchange.exe Path** | Full path to IcmExchange executable | Auto-detected |
-A second dialog will ask for the **total timestep count** (since the UI cannot count timesteps — only IcmExchange can).
+| **IcmExchange.exe Path** | Full path to IcmExchange executable; adjust for your installation | ICM Ultimate 2026 installation path |
+A second dialog asks for a positive whole-number **total timestep count** because this workflow reads simulation timesteps through IcmExchange. Every worker compares this count with `list_timesteps.count` before exporting. Both underestimates and overestimates fail with the actual count in the error log; regenerate the scripts with that count. Counts are not silently clamped.
 #### Step 2: Launch the Batch File
-Double-click `launch_parallel.bat`. Worker processes run **minimized in the taskbar** — no pop-up windows. The master window automatically detects when all workers are done and runs the merge.
+Open the new subfolder shown by the generator and double-click `launch_parallel.bat`. Worker processes run **minimized in the taskbar**. The launcher checks every worker's error log before waiting for pending workers. A process wrapper detects unsuccessful exits and exits without a completion record, including failures before Ruby starts. The merge starts only after every process has exited and every worker has a success record.
 #### Step 3: Collect Results
-The final CSV is named `<Simulation Name>_Hazard Mapping.csv` in your output folder. All temporary files (worker scripts, done files, merge script, batch file) are automatically cleaned up — only the final CSV remains.
+The final CSV is named `<Simulation Name>_Hazard Mapping.csv` in the new subfolder. Use it only when the launcher reports **All done!** and `merge_done.txt` exists without an error log. The merge checks contiguous timestep coverage, expected row counts, matching element IDs, numeric values and CSV headers. It writes a `.partial` file and renames it only after a successful write. Scripts, chunk CSVs and logs are retained for diagnosis; temporary MIF/MID files are still deleted after each successful timestep.
+
+#### Failure handling and scope
+- Missing, empty, malformed or multiple MIF/MID outputs fail explicitly. This exporter supports one MIF/MID pair per timestep; multi-file exports require separate support rather than silently selecting the first file.
+- Element IDs must be unique and the same across timesteps and workers. This catches missing rows relative to the first export, but does not independently verify that ICM exported every element of the original mesh.
+- The default worker wait limit is 24 hours. For a longer legitimate export, edit `set max_polls=17280` in the generated launcher before its first use (each poll waits five seconds; for example, `34560` is approximately 48 hours).
+- On failure, inspect `worker_N_error.log`, `worker_N_console.log` or `merge_error.log`. Partial timestep/chunk CSVs are diagnostic only. Other workers may still be running; stop them before removing files. Regenerate into a fresh subfolder to retry. A generated launcher is single-use, which prevents stale success files from satisfying a rerun.
+- The wait limit covers the parallel workers; the final IcmExchange merge invocation remains synchronous. The changes do not alter hazard formulas, timestep partitioning or the GIS export API.
+
+## Validation
+Run the offline regression suite with a Ruby installation that provides `csv`:
+```text
+ruby -c export_2d_mesh.rb
+ruby test/reliability_test.rb
+```
+The suite executes generated scripts against a fake ICM API and simulated worker files. It covers count mismatches, missing/malformed exports, worker exceptions, incomplete chunks and known maxima. On Windows it also exercises the batch launcher with Ruby standing in for IcmExchange, including native-style failure exits, absent status files, timeout, merge failure and stale-run refusal. No ICM installation or database is used by these tests.
+
+Before operational use, validate in your installed ICM version against a small, known simulation:
+1. Export with the exact timestep count using one worker and then multiple workers. Compare all element IDs, maxima and timestep indices, including the final timestep, against a trusted reference.
+2. Enter one fewer and one extra timestep. Confirm an explicit count-mismatch error, no merge and no final CSV.
+3. Try an invalid IcmExchange path and interrupt one worker. Confirm failure is reported and no incomplete final CSV is published.
+4. Confirm the actual MIF schema, element coverage and zero/dry values match the assumptions above. The offline tests do not establish live ICM compatibility or hydraulic correctness.
 ## Files
 | File | Purpose |
 |---|---|
-| `export_2d_mesh.rb` | Single-threaded generator script (run inside ICM) |
-| `export_2d_mesh_parallel.rb` | Parallel generator v1 (manual merge trigger) |
-| `export_2d_mesh_parallel_v2.rb` | Parallel generator v2 (auto-close workers, auto-merge) |
-| `calc_max_dxv.sql` | ICM SQL stored query for verifying DxV logic on individual elements |
-| `diagnose_2d.rb` | Diagnostic script for listing available 2D result tables |
-| `diagnose_2d_v2.rb` | Extended diagnostic script with table enumeration |
+| `export_2d_mesh.rb` | Parallel generator script (run inside ICM; use one worker for serial execution) |
+| `test/reliability_test.rb`, `test/fake_icm.rb` | Offline regression tests and simulated ICM API |
 | `ICM_Scripting_Learnings.md` | Technical learnings and API gotchas documented during development |
 ## Requirements
 - **InfoWorks ICM** (2024 or later, with IcmExchange)
